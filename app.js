@@ -1,5 +1,5 @@
 const http = require('http');
 
 http.createServer((req, res) => {
-  res.end("Hello from EKS using AWS Codepipeline 🚀");
+  res.end("sample application for testing 🚀");
 }).listen(3000);
