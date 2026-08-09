@@ -1,0 +1,34 @@
+replicaCount: 2
+
+image:
+  repository: 993726039123.dkr.ecr.<REGION>.amazonaws.com/sample-app   # set by --set or CI
+  tag: latest
+  pullPolicy: Always
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 3000       # matches app.js -> http.createServer(...).listen(3000)
+
+ingress:
+  enabled: true
+  className: alb
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip          # ALB -> pod IPs directly (works with ClusterIP service)
+    alb.ingress.kubernetes.io/healthcheck-path: /
+  host: ""            # leave blank to match all traffic -> use the ALB's own DNS name as the target
+  path: /
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi
+
+# app.js has no dedicated /healthz route — every path returns the banner text,
+# so probes just hit "/".
+probes:
+  path: /
