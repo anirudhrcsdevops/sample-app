@@ -2,8 +2,14 @@ name: Build, Deploy & DAST Scan
 
 # Single pipeline: build sample-app -> push to ECR -> deploy to EKS via Helm
 # -> run OWASP ZAP baseline scan -> run OWASP ZAP full scan.
-# No API/OpenAPI scan is used (sample-app exposes no spec) — only
-# zaproxy/action-baseline and zaproxy/action-full-scan.
+# No API/OpenAPI scan is used (sample-app exposes no spec).
+#
+# The ZAP scans run ON THE EC2 SSM BOX (i-0e5bca577977536e9), not inside the
+# GitHub-hosted runner: this job triggers them via `aws ssm send-command` and
+# polls for completion. Reports are written to and stay on that instance at
+# /home/ec2-user/zap-reports/ — nothing is uploaded as a GitHub artifact and
+# nothing goes to S3. To read a report afterwards, see the SSM port-forwarding
+# steps in the runbook (or `aws ssm start-session` + `cat`/`less`).
 #
 # Manual only — no push trigger. Run it from Actions -> Build, Deploy &
 # DAST Scan -> Run workflow.
@@ -27,11 +33,11 @@ env:
   # ALB already exists and its DNS name is stable as long as the Ingress/Service
   # aren't deleted — no need to poll for it on every run.
   TARGET_URL: http://k8s-sampleap-sampleap-35f57b1a42-780473636.ap-south-1.elb.amazonaws.com
+  ZAP_INSTANCE_ID: i-0e5bca577977536e9
 
 permissions:
   id-token: write     # OIDC -> AssumeRoleWithWebIdentity
   contents: read
-  issues: write        # lets the ZAP actions optionally file an issue with results
 
 jobs:
   # ---------- 1. Build image, push to ECR, deploy to EKS ----------
@@ -77,34 +83,116 @@ jobs:
             --set image.tag="$IMAGE_TAG" \
             --wait --timeout 5m
 
-  # ---------- 2. OWASP ZAP baseline (passive) scan ----------
+  # ---------- 2. OWASP ZAP baseline (passive) scan — runs on the EC2 SSM box ----------
   zap-baseline:
     needs: build-and-deploy
     if: ${{ inputs.scan_type == 'baseline' || inputs.scan_type == 'both' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: ZAP Baseline Scan
-        uses: zaproxy/action-baseline@v0.15.0
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          target: ${{ env.TARGET_URL }}
-          cmd_options: '-a'
-          artifact_name: 'zap-baseline-report'
-          fail_action: false
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
-  # ---------- 3. OWASP ZAP full (active) scan ----------
+      - name: Run ZAP baseline scan on EC2 via SSM
+        run: |
+          cat > /tmp/zap-cmd.json <<EOF
+          {
+            "commands": [
+              "mkdir -p /home/ec2-user/zap-reports",
+              "chmod 777 /home/ec2-user/zap-reports",
+              "docker run --rm -v /home/ec2-user/zap-reports:/zap/wrk:rw ghcr.io/zaproxy/zaproxy:stable zap-baseline.py -t ${TARGET_URL} -r baseline-report.html -J baseline-report.json -w baseline-report.md -I",
+              "echo ---RISK-SUMMARY---",
+              "jq -r '.site[0].alerts[] | [.riskdesc, .name] | @tsv' /home/ec2-user/zap-reports/baseline-report.json | sort | uniq -c | sort -rn",
+              "echo ---FILES---",
+              "ls -la /home/ec2-user/zap-reports/"
+            ]
+          }
+          EOF
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$ZAP_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "ZAP baseline scan - GH Actions run ${{ github.run_id }}" \
+            --timeout-seconds 1800 \
+            --parameters file:///tmp/zap-cmd.json \
+            --region "$AWS_REGION" \
+            --query 'Command.CommandId' --output text)
+          echo "SSM command: $COMMAND_ID"
+
+          STATUS="Pending"
+          for i in $(seq 1 120); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$ZAP_INSTANCE_ID" --region "$AWS_REGION" --query 'Status' --output text 2>/dev/null || echo Pending)
+            echo "status: $STATUS"
+            [[ "$STATUS" == "Success" || "$STATUS" == "Failed" ]] && break
+            sleep 15
+          done
+
+          echo "=== ZAP scan output ==="
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$ZAP_INSTANCE_ID" --region "$AWS_REGION" --query 'StandardOutputContent' --output text
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "::error::ZAP baseline scan did not succeed (status: $STATUS)"
+            aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$ZAP_INSTANCE_ID" --region "$AWS_REGION" --query 'StandardErrorContent' --output text
+            exit 1
+          fi
+
+          echo "Report saved on the instance at /home/ec2-user/zap-reports/baseline-report.{html,json,md}"
+
+  # ---------- 3. OWASP ZAP full (active) scan — runs on the EC2 SSM box ----------
   zap-full-scan:
     needs: build-and-deploy
     if: ${{ inputs.scan_type == 'full' || inputs.scan_type == 'both' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: ZAP Full Scan
-        uses: zaproxy/action-full-scan@v0.13.0
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          target: ${{ env.TARGET_URL }}
-          cmd_options: '-a'
-          artifact_name: 'zap-full-scan-report'
-          fail_action: false
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run ZAP full scan on EC2 via SSM
+        run: |
+          cat > /tmp/zap-cmd.json <<EOF
+          {
+            "commands": [
+              "mkdir -p /home/ec2-user/zap-reports",
+              "chmod 777 /home/ec2-user/zap-reports",
+              "docker run --rm -v /home/ec2-user/zap-reports:/zap/wrk:rw ghcr.io/zaproxy/zaproxy:stable zap-full-scan.py -t ${TARGET_URL} -r full-report.html -J full-report.json -w full-report.md -I",
+              "echo ---RISK-SUMMARY---",
+              "jq -r '.site[0].alerts[] | [.riskdesc, .name] | @tsv' /home/ec2-user/zap-reports/full-report.json | sort | uniq -c | sort -rn",
+              "echo ---FILES---",
+              "ls -la /home/ec2-user/zap-reports/"
+            ]
+          }
+          EOF
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$ZAP_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "ZAP full scan - GH Actions run ${{ github.run_id }}" \
+            --timeout-seconds 3600 \
+            --parameters file:///tmp/zap-cmd.json \
+            --region "$AWS_REGION" \
+            --query 'Command.CommandId' --output text)
+          echo "SSM command: $COMMAND_ID"
+
+          STATUS="Pending"
+          for i in $(seq 1 240); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$ZAP_INSTANCE_ID" --region "$AWS_REGION" --query 'Status' --output text 2>/dev/null || echo Pending)
+            echo "status: $STATUS"
+            [[ "$STATUS" == "Success" || "$STATUS" == "Failed" ]] && break
+            sleep 15
+          done
+
+          echo "=== ZAP scan output ==="
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$ZAP_INSTANCE_ID" --region "$AWS_REGION" --query 'StandardOutputContent' --output text
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "::error::ZAP full scan did not succeed (status: $STATUS)"
+            aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$ZAP_INSTANCE_ID" --region "$AWS_REGION" --query 'StandardErrorContent' --output text
+            exit 1
+          fi
+
+          echo "Report saved on the instance at /home/ec2-user/zap-reports/full-report.{html,json,md}"
