@@ -1,0 +1,128 @@
+name: Build, Deploy & DAST Scan
+
+# Single pipeline: build sample-app -> push to ECR -> deploy to EKS via Helm
+# -> run OWASP ZAP baseline scan -> run OWASP ZAP full scan.
+# No API/OpenAPI scan is used (sample-app exposes no spec) — only
+# zaproxy/action-baseline and zaproxy/action-full-scan.
+#
+# Manual only — no push trigger. Run it from Actions -> Build, Deploy &
+# DAST Scan -> Run workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      scan_type:
+        description: "ZAP scan(s) to run after deploy"
+        required: true
+        default: "both"
+        type: choice
+        options: [baseline, full, both]
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: sample-app
+  EKS_CLUSTER: sample-application
+  HELM_RELEASE: sample-application
+  NAMESPACE: sample-application
+
+permissions:
+  id-token: write     # OIDC -> AssumeRoleWithWebIdentity
+  contents: read
+  issues: write        # lets the ZAP actions optionally file an issue with results
+
+jobs:
+  # ---------- 1. Build image, push to ECR, deploy to EKS ----------
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    outputs:
+      target_url: ${{ steps.get-url.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag and push image
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" -f dockerfile .
+          docker push "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name "$EKS_CLUSTER" --region "$AWS_REGION"
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.15.4
+
+      - name: Deploy with Helm
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          helm upgrade --install "$HELM_RELEASE" ./helm/sample-application \
+            --namespace "$NAMESPACE" --create-namespace \
+            --set image.repository="$REGISTRY/$ECR_REPOSITORY" \
+            --set image.tag="$IMAGE_TAG" \
+            --wait --timeout 5m
+
+      - name: Resolve target URL from ALB ingress
+        id: get-url
+        run: |
+          echo "Waiting for the ALB to be provisioned by aws-load-balancer-controller..."
+          HOST=""
+          for i in $(seq 1 30); do
+            HOST=$(kubectl get ingress "$HELM_RELEASE" -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            [ -n "$HOST" ] && break
+            echo "  ...not ready yet, retrying in 10s"
+            sleep 10
+          done
+          if [ -z "$HOST" ]; then
+            echo "::error::ALB hostname never appeared on the Ingress status"
+            kubectl describe ingress "$HELM_RELEASE" -n "$NAMESPACE"
+            exit 1
+          fi
+          echo "ALB hostname: $HOST"
+          echo "url=http://$HOST" >> "$GITHUB_OUTPUT"
+
+  # ---------- 2. OWASP ZAP baseline (passive) scan ----------
+  zap-baseline:
+    needs: build-and-deploy
+    if: ${{ inputs.scan_type == 'baseline' || inputs.scan_type == 'both' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: ${{ needs.build-and-deploy.outputs.target_url }}
+          cmd_options: '-a'
+          artifact_name: 'zap-baseline-report'
+          fail_action: false
+
+  # ---------- 3. OWASP ZAP full (active) scan ----------
+  zap-full-scan:
+    needs: build-and-deploy
+    if: ${{ inputs.scan_type == 'full' || inputs.scan_type == 'both' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ZAP Full Scan
+        uses: zaproxy/action-full-scan@v0.10.0
+        with:
+          target: ${{ needs.build-and-deploy.outputs.target_url }}
+          cmd_options: '-a'
+          artifact_name: 'zap-full-scan-report'
+          fail_action: false
